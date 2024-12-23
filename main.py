@@ -1,10 +1,7 @@
-import requests
+import requests, time, concurrent.futures, random, json, sys
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
-
-max_n = 10
-rootURL = "https://pikabu.ru"
 
 class bcolors:
     HEADER = '\033[95m'
@@ -21,112 +18,170 @@ def printw(string):
     print(bcolors.WARNING + string + bcolors.ENDC)
 def printf(string):
     print(bcolors.FAIL + string + bcolors.ENDC)
+def printOK(string):
+    print(bcolors.OKGREEN + string + bcolors.ENDC)
 
-treeInUse = False
-urlTree = {}
-addedURLs = []
 
-def get_url_info(url):
-    """Возвращает сначала заголовок страницы [0], а потом все найденные ссылки [1]. Если сайт недоступен, ничего не возвращает"""
-    response = requests.get(url)
 
-    if response.status_code == 200:
-        html = BeautifulSoup(response.content, 'html.parser')
-        title = html.find('title')
+root_url = None
+if not sys.argv[0].startswith("http"):
+    printf("Дана неправильная ссылка! Для работы требуется любая ссылка формата https://exapmle.com")
+    quit()
+else:
+    root_url = sys.argv[0]
 
-        urls = html.find_all('a', href=True)
-        #Достаю все URL из <a>
-        urls = [urljoin(url, u['href']) for u in urls]
-        #Убираю www. для однообразия
-        urls = list(map(lambda url: url.replace("www.", ""), urls))
-        #Убираю запросы 
-        urls = list(filter(lambda url: "?" not in str(url), urls))
+depth = None
+if not sys.argv[1].isnumeric():
+    printf("Не дана глубина поиска! Она должна как миниму равняться 2\nЧем больше глубина, тем дольше поиск")
+    quit()
+else:
+    depth = int(sys.argv[1])
 
-        urls = sorted(set(urls))
-        return [title, urls]
+do_render = False
+if not sys.argv[2] == "true":
+    printw("Не указано что нужно отрендерить график после завершения работы, поэтому результат будет выведен в result.txt\nДля рендера перезапустите програму со вторым аргументом как 'true'")
+else:
+    do_render = True
+
+# root_url = "http://127.0.0.1:5000/Home"
+# root_url = sys.argv[0]
+print(f"Собираю карту сайта {root_url}. В зависимости от выбранного уровня глубины поиска это может занять от десятков минут, до часов. Пожалуйста, подождите...")
+
+root_url = root_url.replace("www.", "")
+
+
+gt_time = 60 * 5
+global_timeout = False
+added_urls = []
+
+def get_url_info(url, attempts = 3, wait_min = 60, wait_max = 120):
+    """Возвращает сначала заголовок страницы [0], а потом все найденные ссылки [1]. Если сайт недоступен, ничего не возвращает\n
+    Делает по стандарту 3 попытки (attempts), если не получил ответ 200, ожидая от 30 (wait_min) до 60 (wait_max) секунд перед каждой попыткой. Разброс для того чтобы не было волной"""
+    try:
+        response = requests.get(url)
+    except Exception as e:
+        return [None, "Не получается связаться"]
+
+    if url not in added_urls:
+        added_urls.append(url)
     else:
-        return [None, response.status_code]
+        return [False, "Эта ссылка уже получена"]
 
-def collect_urls(currentUrl, max_n = 4, n = 0):
+    #Делаю повторные попытки, на тот случай, если ошибка 503 или подобная
+    while attempts > 0:
+        if response.status_code == 200:
+            html = BeautifulSoup(response.content, 'html.parser')
+            try: 
+                title = html.find('title').get_text()
+            except:
+                title = "None"
+
+            urls = html.find_all('a', href=True)
+            #Достаю все URL из <a>
+            urls = [urljoin(url, u['href']) for u in urls]
+            #Убираю www. для однообразия
+            urls = list(map(lambda url: url.replace("www.", ""), urls))
+            #Убираю запросы 
+            urls = list(filter(lambda url: "?" not in str(url), urls))
+
+            urls = sorted(set(urls))
+            printOK(f"Успешно получил {url}")
+            return [title, urls]
+        else:
+            #Чтобы избежать ограничений по количеству
+            if response.status_code == 429:
+                printw(f"Получил ошибку {bcolors.FAIL}429{bcolors.WARNING}, получая {url}. Слишком много запросов за минуту. Жду {gt_time} секунд перед продолжением...")
+                
+                #Ожидаю сколько-то секунд
+                if global_timeout == False:
+                    global_timeout = True
+                    time.sleep(gt_time)
+                    global_timeout = False
+                else:
+                    while global_timeout:
+                        time.sleep()
+            else:
+                attempts -= 1
+                if attempts <= 0:
+                    printw(f"Получил ошибку {bcolors.FAIL + str(response.status_code) + bcolors.WARNING}, получая {url}...")
+            time.sleep(random.randint(wait_min, wait_max))
+
+    return [None, response.status_code]
+
+def collect_urls(current_url, max_n = 4, n = 0, max_workers = 20, other_domains = False):
+    """Собирает карту всех ссылок досупных с корневой ссылки (current_url) вызывая самого себя рекурсивно\n
+    Стандартная глубина поиска (max_n) - 4, шаг (n) не трогать, он всегда 0, если ссылка корневая\n
+    Количество одновременно работающих потоков (max_workers) - 20\n
+    Поиск по стандарту осуществляется только для сайтов с тем же доменом, что и корневой. Для отключения этого нужно поставить other_domains на True
+    """
     match n:
         #Если корневая ссылка
         case 0:
-            info = get_url_info(currentUrl)
+            info = get_url_info(current_url)
 
             if info[0]:
-                urlTree[currentUrl] = [info[0], {}]
-                #Повторяю для каждой дочерней ссылки
-                for url in info[1]:
-                    collect_urls(url, max_n, n + 1)
+                tree = {current_url: [info[0], {}]}
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    subprocesses = [executor.submit(collect_urls, url, max_n, n + 1) for url in info[1]]
+
+                    for process in concurrent.futures.as_completed(subprocesses):
+                        url_tree = process.result()
+                        if url_tree:
+                            tree[current_url][1] = tree[current_url][1] | url_tree
+                return tree
             else:
-                printw(f"Не получилось собрать информацию с адреса {currentUrl} Код ошибки: {bcolors.FAIL + str(info[1])}")
+                printw(f"Не получилось собрать информацию с адреса {current_url} Код ошибки: {bcolors.FAIL + str(info[1])}")
                 printf("Невозможно продолжить выполнение программы. Выхожу...")
+                time.sleep(4)
                 quit()
 
         case _ if n == max_n:
-            while True:
-                if not treeInUse:
-                    treeInUse = True
-
-                    urlTree[currentUrl][1]["...", {}]
-
-                    treeInUse = False
-                    break
+            # return {"...": ["...", {}]}
+            return []
 
         case _:
-            info = get_url_info(currentUrl)
+            #Проверяю ссылка ли это вообще
+            try:
+                str(current_url).split("/")[2]
+            except:
+                return []
+            
+            #Если домен не отличается от данного в начале
+            if str(current_url).split("/")[2] == str(root_url).split("/")[2] or other_domains:
+                info = get_url_info(current_url)
 
-            if info[0]:
-                #Если домен не отличается от данного в начале
-                if str(currentUrl).startswith(rootURL):
+                if info[0]:
+                    tree = {current_url: [info[0], {}]}
 
-                    while True:
-                        if not treeInUse:
-                            treeInUse = True
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        subprocesses = [executor.submit(collect_urls, url, max_n, n + 1) for url in info[1]]
 
-                            if currentUrl not in addedURLs:
-                                addedURLs.append(currentUrl)
-                                urlTree[currentUrl] = [info[0], {}]
-                                #Повторяю для каждой дочерней ссылки
-                                for url in info[1]:
-                                    collect_urls(url, max_n, n + 1)
-                            else:
-                                print(f"URL {currentUrl} уже присутсвует в графе. Пропускаю...")
-                                
-                            treeInUse = False
-                            break
+                        for process in concurrent.futures.as_completed(subprocesses):
+                            url_tree = process.result()
+                            if url_tree:
+                                tree[current_url][1] = tree[current_url][1] | url_tree
+
+                    return tree
                 else:
-                    print(f"Домен URL {currentUrl} отличается от начального домена {rootURL}. Пропускаю...")
+                    if info[0] == False:
+                        return []
+                    else:
+                        printw(f"Внимание! Вся дальнейшая ветвь для {current_url} потеряна! Код ошибки: {bcolors.FAIL + str(info[1])}")
+                        printw(f"Рекомендуется перезапустить программу целиком, если это ошибка не была ожидана")
+                        return {"Ошибка": [info[1], {}]}
             else:
-                printw(f"Внимание! Вся дальнейшая ветвь для {currentUrl} потеряна! Код ошибки: {bcolors.FAIL + str(info[1])}")
-                printw(f"Рекомендуется перезапустить программу целиком")
+                print(f"Домен URL {current_url} отличается от начального домена {root_url}. Пропускаю...")
 
+            return []
 
-#     try:
-#         response = requests.get(currentUrl)
+dump = json.dumps(collect_urls(root_url, 10))
+with open("result.txt", 'w') as file:
+    file.write(dump)
 
-#         if response.status_code == 200:
-#             html = BeautifulSoup(response.content, 'html.parser')
-#             urls = html.find_all('a', href=True)
-#             #Достаю все URL из <a>
-#             urls = [urljoin(currentUrl, url['href']) for url in urls]
-#             #Убираю www. для однообразия
-#             urls = list(map(lambda url: url.replace("www.", ""), urls))
-#             #Убираю запросы 
-#             urls = list(filter(lambda url: "?" not in str(url), urls))
+printOK("Готово!")
 
-#             urls = sorted(set(urls))
-#             return urls
-#         else:
-#             printw(f"Не получилось собрать ссылки с адреса {currentUrl}. Код ошибки: {bcolors.FAIL}{response.status_code}")
-#             return []
-#     except KeyboardInterrupt as e:
-#         printw(f"Не получилось собрать ссылки с адреса {currentUrl}. Вероятно такого адреса нет, либо он недоступен. Ошибка:")
-#         print(e)
+if do_render:
+    from turn_to_graph import turn_to_graph
 
-
-# website_url = 'https://reddit.com/'  
-# links = get_all_child_urls(website_url, 10)
-
-# for link in links:
-#     print(link)
+    turn_to_graph("result.txt", False)
